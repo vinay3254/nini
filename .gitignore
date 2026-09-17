@@ -1,0 +1,4 @@
+/target
+*.safetensors
+*.bin
+data/*.txt
