@@ -34,7 +34,7 @@ enum Command {
         loss_out: String,
     },
     Generate {
-        #[arg(long, default_value = "")]
+        #[arg(long, default_value = "ROMEO:")]
         prompt: String,
         #[arg(long, default_value_t = 200)]
         tokens: usize,
