@@ -1,12 +1,15 @@
-use candle_core::{DType, Device};
+use anyhow::bail;
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 use clap::{Parser, Subcommand};
 use std::io::Write;
 
+use tinygpt_rs::attention::no_mask;
 use tinygpt_rs::config::ModelConfig;
 use tinygpt_rs::data::Dataset;
 use tinygpt_rs::generate::generate;
 use tinygpt_rs::model::TinyGpt;
+use tinygpt_rs::sampling::sample;
 use tinygpt_rs::tokenizer::Tokenizer;
 use tinygpt_rs::train::{train, TrainConfig};
 
@@ -40,6 +43,12 @@ enum Command {
         #[arg(long)]
         top_k: Option<usize>,
     },
+    Ablate {
+        #[arg(long, default_value = "ROMEO:")]
+        prompt: String,
+        #[arg(long, default_value_t = 100)]
+        tokens: usize,
+    },
 }
 
 fn device() -> Device {
@@ -51,6 +60,41 @@ fn device() -> Device {
     {
         Device::Cpu
     }
+}
+
+/// Autoregressively generates `max_new_tokens` tokens after `prompt` using the
+/// trained model's forward pass, but with the causal mask replaced by
+/// `no_mask` at every step — i.e. every position can see every other
+/// position, including "future" ones, even though the model was never
+/// trained that way. This has no KV-cache (the ablation loop recomputes the
+/// full forward pass each step) since it exists purely to demonstrate what
+/// the causal mask buys you, not as a performance-sensitive code path.
+fn generate_non_causal(
+    model: &TinyGpt,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f64,
+    top_k: Option<usize>,
+    device: &Device,
+) -> anyhow::Result<String> {
+    let mut ids = tokenizer.encode(prompt);
+    if ids.is_empty() {
+        bail!("generate_non_causal: prompt encoded to zero tokens (empty or entirely out-of-vocab)");
+    }
+    let mut rng = rand::rng();
+
+    for _ in 0..max_new_tokens {
+        let t = ids.len();
+        let input = Tensor::from_vec(ids.clone(), (1, t), device)?;
+        let mask = no_mask(t, device)?;
+        let logits = model.forward_with_mask(&input, &mask)?;
+        let last_logits = logits.narrow(1, t - 1, 1)?.flatten_all()?;
+        let next_id = sample(&last_logits, temperature, top_k, None, &mut rng)?;
+        ids.push(next_id);
+    }
+
+    Ok(tokenizer.decode(&ids))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -95,6 +139,25 @@ fn main() -> anyhow::Result<()> {
 
             let output = generate(&model, &tokenizer, &prompt, tokens, temperature, top_k, None, &device)?;
             println!("{output}");
+        }
+        Command::Ablate { prompt, tokens } => {
+            let text = std::fs::read_to_string("data/tinyshakespeare.txt")?;
+            let tokenizer = Tokenizer::from_corpus(&text);
+            let model_cfg = ModelConfig::small(tokenizer.vocab_size());
+
+            let mut varmap = VarMap::new();
+            let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+            let model = TinyGpt::new(&model_cfg, vb)?;
+            varmap.load("model.safetensors")?;
+
+            let causal = generate(&model, &tokenizer, &prompt, tokens, 0.8, Some(40), None, &device)?;
+            let non_causal = generate_non_causal(&model, &tokenizer, &prompt, tokens, 0.8, Some(40), &device)?;
+
+            println!("-- causal (normal) --");
+            println!("{causal}");
+            println!();
+            println!("-- non-causal (ablation) --");
+            println!("{non_causal}");
         }
     }
     Ok(())

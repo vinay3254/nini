@@ -48,6 +48,25 @@ impl TinyGpt {
         self.head.forward(&x)
     }
 
+    /// Runs a full forward pass using an explicit attention mask instead of
+    /// building the standard causal mask internally. Used only by the
+    /// `ablate` CLI demo to show what happens when the trained model is
+    /// forced through a non-causal mask (e.g. `attention::no_mask`) —
+    /// never used for training or normal generation.
+    pub fn forward_with_mask(&self, input_ids: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let (_b, t) = input_ids.dims2()?;
+        let device = input_ids.device();
+        let tok = self.token_emb.forward(input_ids)?;
+        let positions = Tensor::arange(0u32, t as u32, device)?;
+        let pos = self.pos_emb.forward(&positions)?.unsqueeze(0)?;
+        let mut x = tok.broadcast_add(&pos)?;
+        for block in &self.blocks {
+            x = block.forward(&x, mask)?;
+        }
+        let x = self.final_norm.forward(&x)?;
+        self.head.forward(&x)
+    }
+
     /// Runs one incremental decoding step: `input_ids` is a single new token
     /// (shape (1,1)) or the initial prompt chunk; `caches` holds one KvCache
     /// per decoder block and must be reused across calls for the same sequence.
@@ -101,6 +120,31 @@ mod tests {
         let ids = Tensor::from_vec(vec![1u32, 2, 3, 4, 5, 6], (1, 6), &device)?;
         let logits = model.forward(&ids)?;
         assert_eq!(logits.dims(), &[1, 6, 50]);
+        Ok(())
+    }
+
+    /// `forward_with_mask` given the standard causal mask must reproduce
+    /// `forward`'s output exactly, since `forward` is just `forward_with_mask`
+    /// with the causal mask built internally. This guards the `ablate` CLI's
+    /// non-causal path against silently diverging from the real forward pass.
+    #[test]
+    fn forward_with_mask_matches_forward_when_given_causal_mask() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut cfg = ModelConfig::small(50);
+        cfg.hidden_size = 16;
+        cfg.n_layers = 2;
+        cfg.n_heads = 2;
+        cfg.ffn_hidden = 32;
+        cfg.seq_len = 10;
+        let model = TinyGpt::new(&cfg, vb)?;
+        let ids = Tensor::from_vec(vec![1u32, 2, 3, 4], (1, 4), &device)?;
+        let expected = model.forward(&ids)?;
+        let mask = crate::attention::causal_mask(4, &device)?;
+        let actual = model.forward_with_mask(&ids, &mask)?;
+        let diff = (expected - actual)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "forward_with_mask(causal) should match forward exactly, diff={diff}");
         Ok(())
     }
 

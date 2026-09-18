@@ -1,4 +1,4 @@
-use candle_core::{Device, Result, Tensor, D};
+use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{linear, ops, Linear, Module, VarBuilder};
 
 /// Builds the additive causal attention mask of shape `(1, 1, seq_len, seq_len)`.
@@ -12,6 +12,13 @@ pub fn causal_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
         .flat_map(|i| (0..seq_len).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
         .collect();
     Tensor::from_vec(mask, (1, 1, seq_len, seq_len), device)
+}
+
+/// A mask that allows every position to attend to every other position
+/// (i.e. no causal restriction) — used only for the ablation demo, never
+/// for training or normal generation.
+pub fn no_mask(seq_len: usize, device: &Device) -> Result<Tensor> {
+    Tensor::zeros((1, 1, seq_len, seq_len), DType::F32, device)
 }
 
 /// Hand-composed causal multi-head self-attention.
@@ -134,6 +141,24 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn no_mask_gives_nonzero_weight_to_future_tokens() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let attn = CausalSelfAttention::new(8, 2, vb)?;
+        let x = Tensor::randn(0f32, 1f32, (1, 4, 8), &device)?;
+        let mask = no_mask(4, &device)?;
+        let weights = attn.attention_weights(&x, &mask)?;
+        let w: Vec<f32> = weights.flatten_all()?.to_vec1()?;
+        // position 0 attending to position 3 (a future token) should now be > 0
+        let t = 4;
+        let (head, query, key) = (0usize, 0usize, 3usize);
+        let idx = head * t * t + query * t + key;
+        assert!(w[idx] > 1e-6);
         Ok(())
     }
 
