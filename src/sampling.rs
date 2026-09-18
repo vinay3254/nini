@@ -10,6 +10,13 @@ pub fn sample(
     top_p: Option<f64>,
     rng: &mut impl Rng,
 ) -> Result<u32> {
+    // Guard against temperature == 0 (or a tiny positive value): dividing by
+    // it would produce +/-inf logits, softmax would yield NaN probabilities,
+    // and the top_k sort below (`partial_cmp(...).unwrap()`) panics on NaN.
+    // Clamping to a small positive floor makes temperature=0 behave as an
+    // effectively-argmax sharp softmax instead, which is what a caller
+    // asking for greedy/deterministic decoding actually wants.
+    let temperature = temperature.max(1e-6);
     let scaled = (logits / temperature)?;
     let probs = ops::softmax(&scaled, D::Minus1)?;
     let mut probs: Vec<f32> = probs.to_vec1()?;
@@ -66,6 +73,25 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(0);
         let id = sample(&logits, 0.01, None, None, &mut rng)?;
         assert_eq!(id, 1); // index of the max logit
+        Ok(())
+    }
+
+    /// Regression test: `temperature = 0.0` must not panic (it used to divide
+    /// logits by zero, producing +/-inf, then NaN probabilities that made the
+    /// top_k sort's `partial_cmp(...).unwrap()` panic on NaN). It should behave
+    /// as an effectively-argmax sharp softmax instead.
+    #[test]
+    fn zero_temperature_does_not_panic_and_is_argmax() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[1f32, 5f32, 2f32, 0f32], &device)?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+        let id = sample(&logits, 0.0, None, None, &mut rng)?;
+        assert_eq!(id, 1); // index of the max logit
+
+        // Also confirm it doesn't panic when combined with top_k.
+        let logits = Tensor::new(&[1f32, 5f32, 2f32, 0f32, 9f32], &device)?;
+        let id = sample(&logits, 0.0, Some(2), None, &mut rng)?;
+        assert_eq!(id, 4); // index of the max logit among the top_k=2 candidates
         Ok(())
     }
 
