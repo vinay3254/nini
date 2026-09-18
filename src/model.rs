@@ -35,17 +35,8 @@ impl TinyGpt {
 
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let (_b, t) = input_ids.dims2()?;
-        let device = input_ids.device();
-        let tok = self.token_emb.forward(input_ids)?;
-        let positions = Tensor::arange(0u32, t as u32, device)?;
-        let pos = self.pos_emb.forward(&positions)?.unsqueeze(0)?;
-        let mut x = tok.broadcast_add(&pos)?;
-        let mask = causal_mask(t, device)?;
-        for block in &self.blocks {
-            x = block.forward(&x, &mask)?;
-        }
-        let x = self.final_norm.forward(&x)?;
-        self.head.forward(&x)
+        let mask = causal_mask(t, input_ids.device())?;
+        self.forward_with_mask(input_ids, &mask)
     }
 
     /// Runs a full forward pass using an explicit attention mask instead of
@@ -145,6 +136,53 @@ mod tests {
         let actual = model.forward_with_mask(&ids, &mask)?;
         let diff = (expected - actual)?.abs()?.sum_all()?.to_scalar::<f32>()?;
         assert!(diff < 1e-6, "forward_with_mask(causal) should match forward exactly, diff={diff}");
+        Ok(())
+    }
+
+    /// Full-model regression test for the KV-cache path: `forward_cached`,
+    /// replayed across a prefill chunk plus several single-token steps at
+    /// incrementing `position_offset`, must reproduce `forward`'s logits for
+    /// the same sequence. This is the highest-risk composition in the
+    /// KV-cache/generation feature — it's where `position_offset`-based
+    /// position embeddings and the narrowed causal mask
+    /// (`causal_mask(total_len).narrow(2, offset, t)`) actually get exercised
+    /// together, and `CausalSelfAttention::forward_cached` alone (tested in
+    /// attention.rs) doesn't cover either of those.
+    #[test]
+    fn forward_cached_matches_forward_full_recompute() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let mut cfg = ModelConfig::small(50);
+        cfg.hidden_size = 16;
+        cfg.n_layers = 2;
+        cfg.n_heads = 2;
+        cfg.ffn_hidden = 32;
+        cfg.seq_len = 10;
+        let model = TinyGpt::new(&cfg, vb)?;
+
+        let ids_vec = vec![1u32, 2, 3, 4, 5, 6];
+        let ids = Tensor::from_vec(ids_vec.clone(), (1, ids_vec.len()), &device)?;
+        let expected = model.forward(&ids)?; // (1, 6, vocab)
+
+        let mut caches: Vec<crate::kv_cache::KvCache> =
+            (0..model.n_layers()).map(|_| crate::kv_cache::KvCache::new()).collect();
+
+        // Prefill with the first 3 tokens at position_offset=0.
+        let prefill_ids = Tensor::from_vec(ids_vec[..3].to_vec(), (1, 3), &device)?;
+        let mut all_logits = vec![model.forward_cached(&prefill_ids, 0, &mut caches)?];
+
+        // Feed the remaining tokens one at a time at the correct incrementing offset.
+        for (i, &id) in ids_vec[3..].iter().enumerate() {
+            let position_offset = 3 + i;
+            let token = Tensor::from_vec(vec![id], (1, 1), &device)?;
+            all_logits.push(model.forward_cached(&token, position_offset, &mut caches)?);
+        }
+
+        let cached_full = Tensor::cat(&all_logits, 1)?; // (1, 6, vocab)
+        assert_eq!(cached_full.dims(), expected.dims());
+        let diff = (&expected - &cached_full)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-4, "forward_cached should match forward exactly, diff={diff}");
         Ok(())
     }
 
