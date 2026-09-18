@@ -1,5 +1,5 @@
 use candle_core::backprop::GradStore;
-use candle_core::{Device, Result, Var};
+use candle_core::{Device, Result, Tensor, Var};
 use candle_nn::{loss, AdamW, Optimizer, ParamsAdamW, VarMap};
 use rand::SeedableRng;
 
@@ -27,14 +27,28 @@ fn cosine_lr(step: usize, cfg: &TrainConfig) -> f64 {
 }
 
 /// Global L2 norm over all parameter gradients present in `grads`.
+///
+/// Accumulates the sum-of-squares as a `Tensor` across all vars (keeping the
+/// reduction on-device) and only calls `.to_scalar::<f32>()` once at the end,
+/// rather than once per parameter tensor — with ~60 parameter tensors in the
+/// default model config, a per-tensor `.to_scalar()` call is a GPU->CPU sync
+/// that stalls the CUDA pipeline once per tensor per step.
 fn grad_total_norm(grads: &GradStore, vars: &[Var]) -> Result<f64> {
-    let mut sum_sq = 0f64;
+    let mut sum_sq: Option<Tensor> = None;
     for var in vars {
         if let Some(g) = grads.get(var) {
-            sum_sq += g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+            let s = g.sqr()?.sum_all()?;
+            sum_sq = Some(match sum_sq {
+                Some(acc) => (acc + s)?,
+                None => s,
+            });
         }
     }
-    Ok(sum_sq.sqrt())
+    let total = match sum_sq {
+        Some(t) => t.to_scalar::<f32>()? as f64,
+        None => 0.0,
+    };
+    Ok(total.sqrt())
 }
 
 /// Train `model` in place on `dataset`, returning the loss at every step.
