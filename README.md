@@ -352,7 +352,7 @@ flowchart TD
 
 ### Workflow 4: Architectural Ablation Study
 
-Demonstrates verifiable structural understanding by evaluating performance and generative characteristics under controlled degradations:
+Demonstrates verifiable structural understanding by evaluating generative characteristics under a controlled degradation. The `ablate` CLI subcommand runs both branches below from the same trained weights and prints both outputs side by side:
 
 ```mermaid
 flowchart LR
@@ -365,12 +365,9 @@ flowchart LR
         B1["No Causal Mask (Full Attention)"] --> B2["Future Tokens Leak into Past"]
         B2 --> B3["Output: Degenerates / Repetitive Loops"]
     end
-
-    subgraph AblationHeads ["3. Attention Head Count Ablation"]
-        C1["Scale Heads: 1 vs 6 vs 12"] --> C2["Compute Capacity & Expressivity"]
-        C2 --> C3["Output: Perplexity & Loss Convergence Curves"]
-    end
 ```
+
+**Future work (not implemented):** an attention head-count ablation (e.g. comparing 1 vs. 6 vs. 12 heads on perplexity/loss convergence) would be a natural extension of this workflow, but it does not exist today — there is no head-count variant in the code, and the `ablate` subcommand only ever compares causal vs. non-causal masking as shown above.
 
 ---
 
@@ -466,21 +463,40 @@ cargo build --release --features cuda
 
 ### Training & Inference
 
+The CLI has three subcommands: `train`, `generate`, and `ablate`.
+
 ```bash
 # Train on tiny-Shakespeare using CUDA
 cargo run --release --features cuda -- train \
   --data data/tinyshakespeare.txt \
-  --batch-size 32 \
-  --seq-len 256 \
-  --epochs 10
+  --steps 2000 \
+  --batch-size 24 \
+  --lr 3e-4 \
+  --loss-out loss.csv
 
-# Generate text with KV-Cache and Nucleus Sampling
+# Generate text with KV-Cache sampling (loads model.safetensors from the
+# current directory, written by `train` above)
 cargo run --release --features cuda -- generate \
   --prompt "First Citizen:" \
-  --max-tokens 200 \
+  --tokens 200 \
   --temperature 0.8 \
-  --top-p 0.95
+  --top-k 40
+
+# Compare causal vs. non-causal (unmasked) generation from the same weights
+cargo run --release --features cuda -- ablate \
+  --prompt "ROMEO:" \
+  --tokens 100
 ```
+
+Flags and defaults:
+
+| Subcommand | Flags | Defaults |
+| :--- | :--- | :--- |
+| `train` | `--data`, `--steps`, `--batch-size`, `--lr`, `--loss-out` | `data/tinyshakespeare.txt`, `2000`, `24`, `3e-4`, `loss.csv` |
+| `generate` | `--prompt`, `--tokens`, `--temperature`, `--top-k` | `ROMEO:`, `200`, `0.8`, unset (no top-k filtering) |
+| `ablate` | `--prompt`, `--tokens` | `ROMEO:`, `100` |
+
+Note: there is currently no `--top-p`, `--seq-len`, `--epochs`, or `--max-tokens` flag on any subcommand — `generate` and `ablate` always read the tiny-Shakespeare corpus path and `model.safetensors` from the working directory.
 
 ---
 
