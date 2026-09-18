@@ -2,3 +2,4 @@
 *.safetensors
 *.bin
 data/*.txt
+loss.csv

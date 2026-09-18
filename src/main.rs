@@ -23,7 +23,7 @@ enum Command {
         data: String,
         #[arg(long, default_value_t = 2000)]
         steps: usize,
-        #[arg(long, default_value_t = 64)]
+        #[arg(long, default_value_t = 24)]
         batch_size: usize,
         #[arg(long, default_value_t = 3e-4)]
         lr: f64,
@@ -69,7 +69,9 @@ fn main() -> anyhow::Result<()> {
             let model = TinyGpt::new(&model_cfg, vb)?;
 
             let train_cfg = TrainConfig { steps, batch_size, lr, warmup_steps: steps / 20, grad_clip: 1.0 };
+            let start = std::time::Instant::now();
             let losses = train(&model, &varmap, &dataset, &model_cfg, &train_cfg, &device)?;
+            let elapsed = start.elapsed();
 
             let mut f = std::fs::File::create(&loss_out)?;
             writeln!(f, "step,loss")?;
@@ -77,7 +79,9 @@ fn main() -> anyhow::Result<()> {
                 writeln!(f, "{i},{l}")?;
             }
             varmap.save("model.safetensors")?;
+            let tokens_per_sec = batch_size as f64 * model_cfg.seq_len as f64 * steps as f64 / elapsed.as_secs_f64();
             println!("Trained {steps} steps. Final loss: {:.4}. Weights: model.safetensors. Loss log: {loss_out}", losses.last().unwrap());
+            println!("Elapsed: {:.1}s. Throughput: {:.0} tokens/sec.", elapsed.as_secs_f64(), tokens_per_sec);
         }
         Command::Generate { prompt, tokens, temperature, top_k } => {
             let text = std::fs::read_to_string("data/tinyshakespeare.txt")?;
