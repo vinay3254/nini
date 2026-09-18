@@ -47,6 +47,36 @@ impl TinyGpt {
         let x = self.final_norm.forward(&x)?;
         self.head.forward(&x)
     }
+
+    /// Runs one incremental decoding step: `input_ids` is a single new token
+    /// (shape (1,1)) or the initial prompt chunk; `caches` holds one KvCache
+    /// per decoder block and must be reused across calls for the same sequence.
+    pub fn forward_cached(
+        &self,
+        input_ids: &Tensor,
+        position_offset: usize,
+        caches: &mut [crate::kv_cache::KvCache],
+    ) -> Result<Tensor> {
+        let (_b, t) = input_ids.dims2()?;
+        let device = input_ids.device();
+        let tok = self.token_emb.forward(input_ids)?;
+        let positions = Tensor::arange(position_offset as u32, (position_offset + t) as u32, device)?;
+        let pos = self.pos_emb.forward(&positions)?.unsqueeze(0)?;
+        let mut x = tok.broadcast_add(&pos)?;
+        // New chunk attends to itself causally plus everything already cached.
+        let total_len = position_offset + t;
+        let mask = causal_mask(total_len, device)?
+            .narrow(2, position_offset, t)?;
+        for (block, cache) in self.blocks.iter().zip(caches.iter_mut()) {
+            x = block.forward_cached(&x, &mask, cache)?;
+        }
+        let x = self.final_norm.forward(&x)?;
+        self.head.forward(&x)
+    }
+
+    pub fn n_layers(&self) -> usize {
+        self.blocks.len()
+    }
 }
 
 #[cfg(test)]

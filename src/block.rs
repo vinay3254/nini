@@ -28,6 +28,20 @@ impl DecoderBlock {
         let mlp_out = self.mlp.forward(&self.mlp_norm.forward(&x)?)?;
         x + mlp_out
     }
+
+    /// Single-token (or short chunk) incremental forward pass using a KV-cache.
+    /// See `CausalSelfAttention::forward_cached` for the cache contract.
+    pub fn forward_cached(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        cache: &mut crate::kv_cache::KvCache,
+    ) -> Result<Tensor> {
+        let attn_out = self.attn.forward_cached(&self.attn_norm.forward(x)?, mask, cache)?;
+        let x = (x + attn_out)?;
+        let mlp_out = self.mlp.forward(&self.mlp_norm.forward(&x)?)?;
+        x + mlp_out
+    }
 }
 
 #[cfg(test)]
