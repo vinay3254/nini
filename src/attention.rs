@@ -72,6 +72,27 @@ impl CausalSelfAttention {
         let out = out.transpose(1, 2)?.reshape((b, t, c))?.contiguous()?;
         self.o_proj.forward(&out)
     }
+
+    /// Single-token (or short chunk) incremental forward pass using a KV-cache.
+    /// `x` has seq_len == chunk length (1 during greedy decode); `mask` covers
+    /// only the new chunk against the full cached length.
+    pub fn forward_cached(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        cache: &mut crate::kv_cache::KvCache,
+    ) -> Result<Tensor> {
+        let (b, t, c) = x.dims3()?;
+        let (q, k_new, v_new) = self.qkv(x)?;
+        let (k, v) = cache.append(&k_new, &v_new)?;
+        let scale = 1f64 / (self.head_dim as f64).sqrt();
+        let att = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
+        let att = att.broadcast_add(mask)?;
+        let att = ops::softmax(&att, D::Minus1)?;
+        let out = att.matmul(&v)?;
+        let out = out.transpose(1, 2)?.reshape((b, t, c))?.contiguous()?;
+        self.o_proj.forward(&out)
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +134,32 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_forward_matches_uncached_full_recompute() -> candle_core::Result<()> {
+        let device = Device::Cpu;
+        let varmap = VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device);
+        let attn = CausalSelfAttention::new(8, 2, vb)?;
+        let full_x = Tensor::randn(0f32, 1f32, (1, 4, 8), &device)?;
+        let full_mask = causal_mask(4, &device)?;
+        let full_out = attn.forward(&full_x, &full_mask)?;
+
+        // Replay the same 4 tokens one at a time through the cache.
+        let mut cache = crate::kv_cache::KvCache::new();
+        let mut cached_outs = Vec::new();
+        for i in 0..4 {
+            let token = full_x.narrow(1, i, 1)?;
+            let step_mask = Tensor::zeros((1, 1, 1, i + 1), DType::F32, &device)?; // nothing to mask within cache-so-far
+            let out = attn.forward_cached(&token, &step_mask, &mut cache)?;
+            cached_outs.push(out);
+        }
+        let cached_full = Tensor::cat(&cached_outs, 1)?;
+
+        let diff = (full_out - cached_full)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-3, "cached and uncached outputs should match, diff={diff}");
         Ok(())
     }
 }
